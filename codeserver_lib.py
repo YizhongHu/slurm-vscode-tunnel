@@ -254,4 +254,13 @@ def resolve_session_dir(cfg: Dict[str, Any], target: str) -> pathlib.Path:
             raise FileNotFoundError(f"no current session symlink for profile '{target}' at {link}")
         return link.resolve()
 
+    if target.isdigit() and logs_dir.exists():
+        for meta_path in sorted(logs_dir.glob("*/meta.json"), reverse=True):
+            try:
+                meta = load_json(meta_path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(meta.get("job_id", "")) == target:
+                return meta_path.parent.resolve()
+
     return (logs_dir / target).resolve()
