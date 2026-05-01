@@ -8,6 +8,9 @@ from codeserver_lib import ConfigError, expand_path, load_json
 
 READY_PATTERNS = [
     re.compile(r"\bREADY\b"),
+    re.compile(r"Open this link in your browser", re.IGNORECASE),
+    re.compile(r"Server started", re.IGNORECASE),
+    re.compile(r"session is running", re.IGNORECASE),
     re.compile(r"tunnel.+(ready|running|started|listening)", re.IGNORECASE),
     re.compile(r"(ready|running|started|listening).+tunnel", re.IGNORECASE),
 ]
