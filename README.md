@@ -7,15 +7,6 @@ Layout
 ------
 
 - `cs`: primary command-line entry point.
-- `codeserver_submit.py`: submit a new VS Code tunnel job through Slurm.
-- `codeserver_inner.py`: run inside the Slurm job and execute `code tunnel`.
-- `codeserver_status.py`: show Slurm status, session metadata, auth prompts,
-  and recent logs.
-- `codeserver_stop.py`: cancel a running session by Slurm job id.
-- `codeserver_lib.py`: shared config, session, log, and Slurm helpers.
-- `codeserver-proxy`: proxy stdin/stdout to SSH port 22 on the node running a
-  matching Slurm job.
-- `codeserver.toml`: profiles and runtime configuration.
 
 Runtime files are written under `runs/` by default. That directory contains
 generated logs, session metadata, and `state/current*` symlinks.
