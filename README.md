@@ -3,14 +3,6 @@ Slurm VS Code Tunnel
 
 `slurm-vscode-tunnel` is a small Python CLI for running VS Code `code tunnel` inside Slurm allocations. It submits CPU or GPU tunnel jobs, persists session metadata and logs, detects device-login prompts, reports Slurm state, cancels sessions, and can proxy SSH to the allocated compute node.
 
-Layout
-------
-
-- `cs`: primary command-line entry point.
-
-Runtime files are written under `runs/` by default. That directory contains
-generated logs, session metadata, and `state/current*` symlinks.
-
 Requirements
 ------------
 
