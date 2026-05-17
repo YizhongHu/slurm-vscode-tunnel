@@ -1,4 +1,4 @@
-root_dir = "/gpfs/radev/home/ez275/Apps/codeserver/runs"
+root_dir = "~/Apps/slurm-vscode-tunnel/runs"
 default_profile = "cpu"
 code_bin = "code"
 code_tunnel_args = ["tunnel"]
@@ -17,7 +17,10 @@ sbatch_args = [
   "--partition=day",
   "--job-name=codeserver-cpu",
 ]
-pre_commands = []
+pre_commands = [
+  "source /etc/profile.d/modules.sh",
+  "module load VSCode/1.102.3",
+]
 
 [profiles.gpu]
 enabled = true
@@ -30,7 +33,10 @@ sbatch_args = [
   "--gpus=1",
   "--job-name=codeserver-gpu",
 ]
-pre_commands = []
+pre_commands = [
+  "source /etc/profile.d/modules.sh",
+  "module load VSCode/1.102.3",
+]
 
 [profiles.cpu.env]
 # EXAMPLE_VAR = "value"

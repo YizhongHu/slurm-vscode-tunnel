@@ -11,11 +11,15 @@ for cmd in squeue scontrol; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "error: $cmd not found on this host" >&2; exit 127; }
 done
 
-# Find the first running node for the job
-nl=$(squeue -h -u "$USER" -n "$job" -t RUNNING -o %N | head -n1 || true)
+# Find running nodes for the job. Use the first, but do not hide ambiguity.
+mapfile -t matches < <(squeue -h -u "$USER" -n "$job" -t RUNNING -o %N || true)
+nl="${matches[0]:-}"
 if [ -z "$nl" ]; then
   echo "no running allocation found for job name: $job" >&2
   exit 127
+fi
+if [ "${#matches[@]}" -gt 1 ]; then
+  echo "warning: ${#matches[@]} running allocations match job name: $job; codeserver-proxy will use only the first one listed: $nl" >&2
 fi
 
 # Expand NodeList (e.g., r817u09n[01-04]) and pick the first hostname
@@ -35,4 +39,3 @@ else
   # Requires that SSH to localhost works using your forwarded agent.
   exec ssh -o BatchMode=yes -W "$node:22" localhost
 fi
-

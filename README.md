@@ -41,9 +41,12 @@ commands:
   status, stat, i [target]   Show status for latest, profile, session id, or job id.
   list, l                    List known sessions and Slurm state.
   stop, x [target]           Cancel a session by latest, profile, session id, or job id.
-  proxy, p [profile|job]     Proxy stdin/stdout to SSH on the session node.
+  extend [target] DURATION   Add time to a running/pending Slurm job.
+  continue, c [target]       Continue/connect to a running session node.
+  proxy, p [target]          Proxy stdin/stdout to SSH on the session node.
   profiles                   Show configured profiles.
   config                     Show resolved config path and key settings.
+  completion [bash|zsh]      Print shell completion setup.
 
 global options:
   -h, --help                 Show this help message and exit.
@@ -54,7 +57,7 @@ short action flags:
   -i [target]                Alias for: status [target]
   -l                         Alias for: list
   -x [target]                Alias for: stop [target]
-  -p [profile|job]           Alias for: proxy [profile|job]
+  -p [target]                Alias for: proxy [target]
 ```
 
 Submit the default CPU tunnel:
@@ -110,6 +113,31 @@ cs stop 20260501-120000-gpu
 cs stop 1234567
 ```
 
+Extend a pending or running Slurm job by adding time to its current time limit:
+
+```bash
+cs extend 10h
+cs extend cpu 10h
+cs extend gpu 90m
+cs extend 20260501-120000-cpu 02:00:00
+cs extend 1234567 1-00:00:00
+```
+
+`extend` resolves targets the same way as `continue`: default profile, profile
+name, session id, Slurm job id, or explicit job name. It computes a new absolute
+Slurm `TimeLimit` and runs `scontrol update`. Slurm may reject the update if the
+new limit exceeds partition, account, or QOS policy.
+
+Continue/connect to the SSH port of the node running an existing tunnel session:
+
+```bash
+cs continue
+cs continue cpu
+cs continue 20260501-120000-cpu
+cs continue 1234567
+cs c gpu
+```
+
 Proxy to the SSH port of the node running a matching Slurm job:
 
 ```bash
@@ -117,6 +145,10 @@ cs proxy cpu
 cs proxy gpu
 cs proxy codeserver-cpu
 ```
+
+If a profile or job name matches multiple running Slurm jobs, `continue` and
+`proxy` warn and use only the first node listed by Slurm. Use a specific Slurm
+job id or session id to avoid ambiguity.
 
 Show configuration:
 
@@ -127,6 +159,14 @@ cs config
 
 The older `codeserver_submit.py`, `codeserver_status.py`, `codeserver_stop.py`,
 and `codeserver-proxy` commands are kept as compatibility wrappers/tools.
+
+Shell completion candidates come from configured profiles plus known session
+metadata:
+
+```bash
+cs completion bash
+cs completion zsh
+```
 
 Authentication
 --------------
@@ -142,7 +182,7 @@ The scripts are executable. To run them as commands from any directory, make
 sure this folder is on `PATH`:
 
 ```bash
-export PATH="$HOME/Apps/codeserver:$PATH"
+export PATH="$HOME/Apps/slurm-vscode-tunnel:$PATH"
 ```
 
 The current shell setup in `~/.bashrc` includes that path.
