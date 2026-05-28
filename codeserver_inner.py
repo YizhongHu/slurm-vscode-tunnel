@@ -4,13 +4,19 @@ import os
 import pathlib
 import pty
 import shlex
+import signal
 import subprocess
 import sys
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from codeserver_lib import load_config, merged_env
 from codeserver_relay import READY_PATTERNS
+
+
+MAX_RESPAWN_RESTARTS = 3
+RESPAWN_RESTART_DELAY_SECONDS = 5
+TERMINATE_GRACE_SECONDS = 5
 
 
 def cancel_previous_job(job_id: str) -> None:
@@ -31,13 +37,36 @@ def cancel_previous_job(job_id: str) -> None:
     sys.stdout.flush()
 
 
+def terminate_process_group(proc: subprocess.Popen, grace_seconds: float = 5.0) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.1)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def forward_pty_output(
     argv,
     env: Dict[str, str],
     tunnel_log: pathlib.Path,
     previous_job_id: Optional[str],
     ready_timeout: int,
-) -> int:
+) -> Tuple[int, bool]:
     master_fd, slave_fd = pty.openpty()
     try:
         proc = subprocess.Popen(
@@ -47,12 +76,14 @@ def forward_pty_output(
             stderr=slave_fd,
             env=env,
             close_fds=True,
+            start_new_session=True,
         )
     finally:
         os.close(slave_fd)
 
     ready = False
     previous_canceled = False
+    respawn_requested = False
     deadline = time.monotonic() + max(0, ready_timeout)
     buffer = ""
 
@@ -75,6 +106,18 @@ def forward_pty_output(
                 ready = True
                 print("[relay] readiness detected")
                 sys.stdout.flush()
+            if "respawn requested" in buffer.lower():
+                respawn_requested = True
+                msg = (
+                    "[codeserver_inner] VS Code CLI requested respawn; "
+                    "terminating tunnel process group for a clean relaunch"
+                )
+                print(msg)
+                sys.stdout.flush()
+                logf.write((msg + "\n").encode("utf-8"))
+                logf.flush()
+                terminate_process_group(proc, TERMINATE_GRACE_SECONDS)
+                break
             if previous_job_id and ready and not previous_canceled:
                 cancel_previous_job(previous_job_id)
                 previous_canceled = True
@@ -86,13 +129,45 @@ def forward_pty_output(
                 sys.stdout.flush()
                 previous_canceled = True
 
-    _, status = os.waitpid(proc.pid, 0)
+    rc = proc.wait()
     os.close(master_fd)
 
-    if os.WIFEXITED(status):
-        return os.WEXITSTATUS(status)
-    if os.WIFSIGNALED(status):
-        return 128 + os.WTERMSIG(status)
+    if rc < 0:
+        rc = 128 + abs(rc)
+    return rc, respawn_requested
+
+
+def supervise_pty_output(
+    argv,
+    env: Dict[str, str],
+    tunnel_log: pathlib.Path,
+    previous_job_id: Optional[str],
+    ready_timeout: int,
+) -> int:
+    for restart_idx in range(MAX_RESPAWN_RESTARTS + 1):
+        if restart_idx:
+            print(
+                f"[codeserver_inner] relaunching tunnel after respawn "
+                f"({restart_idx}/{MAX_RESPAWN_RESTARTS})"
+            )
+            sys.stdout.flush()
+        rc, respawn_requested = forward_pty_output(
+            argv,
+            env,
+            tunnel_log,
+            previous_job_id,
+            ready_timeout,
+        )
+        if not respawn_requested:
+            return rc
+        if restart_idx >= MAX_RESPAWN_RESTARTS:
+            print(
+                "[codeserver_inner] respawn restart limit reached; "
+                "exiting instead of looping forever"
+            )
+            sys.stdout.flush()
+            return 1
+        time.sleep(RESPAWN_RESTART_DELAY_SECONDS)
     return 1
 
 
@@ -133,7 +208,7 @@ def main() -> int:
         print(f"[relay] ready_timeout={args.relay_ready_timeout}s")
     sys.stdout.flush()
 
-    return forward_pty_output(
+    return supervise_pty_output(
         argv,
         env,
         tunnel_log,
