@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import sys
@@ -10,7 +11,65 @@ sys.path.insert(0, str(ROOT))
 import codeserver_inner
 
 
+class StaleServerCleanupTests(unittest.TestCase):
+    def test_extracts_code_commit_from_version_output(self):
+        text = "code 1.122.1 (commit 8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e)\n"
+
+        self.assertEqual(
+            codeserver_inner.extract_code_commit(text),
+            "8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e",
+        )
+
+    def test_active_server_commit_reads_lru_first_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            servers_dir = pathlib.Path(tmp)
+            (servers_dir / "lru.json").write_text(
+                json.dumps(
+                    [
+                        "Stable-6a44c352bd24569c417e530095901b649960f9f8",
+                        "Stable-8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                codeserver_inner.active_server_commit(servers_dir),
+                "6a44c352bd24569c417e530095901b649960f9f8",
+            )
+
+    def test_active_server_commit_missing_lru_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                codeserver_inner.active_server_commit(pathlib.Path(tmp))
+            )
+
+    def test_live_server_is_never_stale(self):
+        # Regression: the freshly auto-updated server must be protected even
+        # though it differs from the commit seen when the tunnel first launched.
+        live = "6a44c352bd24569c417e530095901b649960f9f8"
+        old = "8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e"
+        protected = {live, old}
+
+        self.assertFalse(codeserver_inner.is_stale_server_commit(live, protected))
+        self.assertTrue(
+            codeserver_inner.is_stale_server_commit(
+                "f6cfa2ea2403534de03f069bdf160d06451ed282", {live}
+            )
+        )
+
+    def test_staging_and_unknown_state_are_never_reaped(self):
+        live = "6a44c352bd24569c417e530095901b649960f9f8"
+        # Staging builds are skipped.
+        self.assertFalse(
+            codeserver_inner.is_stale_server_commit("abc123.staging", {live})
+        )
+        # With no known live commit we must not reap anything.
+        self.assertFalse(codeserver_inner.is_stale_server_commit(live, set()))
+
+
 class RespawnSupervisorTests(unittest.TestCase):
+
     def test_relaunches_after_respawn_request(self):
         old_delay = codeserver_inner.RESPAWN_RESTART_DELAY_SECONDS
         old_grace = codeserver_inner.TERMINATE_GRACE_SECONDS
