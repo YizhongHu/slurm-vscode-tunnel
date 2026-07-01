@@ -610,6 +610,14 @@ def append_relay_extension(
     requested_with_overlap = extra_seconds + overlap
     segments = plan_relay(requested_with_overlap, max_time, overlap)
 
+    print(f"current requested: {relay_format_duration(int(chain.get('requested_time_seconds') or 0))}")
+    print(f"last job id:       {last_job.get('job_id') or '-'}")
+    print(f"last job ends in:  {relay_format_duration(seconds_until_end)}")
+    print(f"relay overlap:     {relay_format_duration(overlap)}")
+    print(f"extension:         {relay_format_duration(extra_seconds)}")
+    print(f"new relay jobs:    {len(segments)}")
+    print()
+
     config_path = pathlib.Path(str(chain.get("config_path") or cfg["config_path"]))
     python_bin = codeserver_submit.batch_python_bin()
     inner_py = pathlib.Path(__file__).resolve().parent / "codeserver_inner.py"
@@ -648,7 +656,14 @@ def append_relay_extension(
             int(seg["duration"]),
             submit_begin,
         )
+        print(
+            f"submitting job-{index:03d}: starts ~+{relay_format_duration(submit_begin)}, "
+            f"runs {relay_format_duration(int(seg['duration']))}, "
+            f"previous={previous_job_id or '-'}",
+            flush=True,
+        )
         job_id = codeserver_submit.submit_cmd(sbatch_cmd, False, "DRY-RUN")
+        print(f"submitted job-{index:03d}:  {job_id}", flush=True)
         submitted.append(job_id)
 
         meta = {
@@ -691,14 +706,22 @@ def cmd_extend(args: argparse.Namespace) -> int:
     if not session_dir.exists():
         die(f"no session found for '{args.target or cfg['default_profile']}'. Use --help for usage.")
 
+    was_chain = (session_dir / "chain.json").exists()
     chain_dir, chain = load_or_create_chain(cfg, session_dir)
+
+    if not was_chain:
+        print(f"converted session to relay chain: {chain['chain_id']}")
+    print(f"extending relay:  {chain['chain_id']}")
+    print(f"profile:         {chain['profile']}")
+    print(f"chain dir:       {chain_dir}")
+    print()
+
     submitted = append_relay_extension(cfg, chain_dir, chain, extra_seconds)
 
+    print()
     print(f"extended relay:  {chain['chain_id']}")
-    print(f"profile:         {chain['profile']}")
     print(f"added:           {relay_format_duration(extra_seconds)}")
     print(f"submitted jobs:  {', '.join(submitted)}")
-    print(f"chain dir:       {chain_dir}")
     print()
     print(f"status:          cs status {chain['chain_id']}")
     print(f"stop:            cs stop {chain['chain_id']}")

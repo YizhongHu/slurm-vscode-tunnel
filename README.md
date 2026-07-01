@@ -212,7 +212,9 @@ cs extend 1234567 1-00:00:00
 name, session id, relay-chain id, or known Slurm job id. If the target is a
 single session, `extend` converts it into a relay chain, then schedules new
 segments with the configured relay overlap. This keeps each Slurm job within
-the profile limit while lengthening the overall session.
+the profile limit while lengthening the overall session. The command prints the
+target chain, current relay timing, planned new segments, and each submitted job
+id as `sbatch` returns.
 
 Continue/connect to the SSH port of the node running an existing tunnel session:
 
