@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 import argparse
 import pathlib
 import shlex
 import shutil
 import subprocess
+import sys
 import tomllib
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,9 @@ from codeserver_relay import (
     profile_time,
     slurm_begin_offset,
 )
+
+
+HOLD_COMMAND = "echo READY; sleep infinity"
 
 
 def build_sbatch_cmd(
@@ -106,6 +110,10 @@ def submit_cmd(sbatch_cmd: List[str], dry_run: bool, dry_id: str) -> str:
     return proc.stdout.strip().split(";", 1)[0]
 
 
+def batch_python_bin() -> str:
+    return sys.executable or shutil.which("python3.11") or shutil.which("python3") or "python3"
+
+
 def update_current_links(state_dir: pathlib.Path, profile_name: str, target: pathlib.Path) -> None:
     relative_target = pathlib.Path("..") / "logs" / target.name
     for link in (state_dir / "current", state_dir / f"current-{profile_name}"):
@@ -148,7 +156,7 @@ def submit_single(
     batch_script = session_dir / "batch.sh"
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    python_bin = shutil.which("python3") or "python3"
+    python_bin = batch_python_bin()
     inner_py = pathlib.Path(__file__).resolve().parent / "codeserver_inner.py"
     ready_timeout = parse_duration(str(profile.get("relay_ready_timeout") or "5m"))
     write_batch_script(
@@ -177,6 +185,7 @@ def submit_single(
         "batch_script": str(batch_script),
         "sbatch_cmd": sbatch_cmd,
         "duration_seconds": duration,
+        "test_command": args.test_command,
     }
     dump_json(meta_json, meta)
     job_id = submit_cmd(sbatch_cmd, args.dry_run, "DRY-RUN")
@@ -216,7 +225,7 @@ def submit_chain(
     chain_dir.mkdir(parents=True, exist_ok=True)
     chain_json = chain_dir / "chain.json"
 
-    python_bin = shutil.which("python3") or "python3"
+    python_bin = batch_python_bin()
     inner_py = pathlib.Path(__file__).resolve().parent / "codeserver_inner.py"
     ready_timeout = parse_duration(str(profile.get("relay_ready_timeout") or "5m"))
 
@@ -327,8 +336,14 @@ def main() -> int:
     ap.add_argument("--time", help="Requested walltime, e.g. 72:00:00, 72h, 3d.")
     ap.add_argument("--relay-overlap", help="How long before expiry to start the next relay job.")
     ap.add_argument("--no-relay", action="store_true", help="Fail instead of splitting requests longer than the profile max.")
+    ap.add_argument("--hold", action="store_true", help="Hold a Slurm allocation open for VS Code Remote-SSH proxying.")
     ap.add_argument("--test-command", help="Developer/test command to run instead of code tunnel, e.g. 'echo READY; sleep 600'.")
     args = ap.parse_args()
+
+    if args.hold and args.test_command:
+        die("--hold and --test-command cannot be used together", code=2)
+    if args.hold:
+        args.test_command = HOLD_COMMAND
 
     config_path = pathlib.Path(args.config).resolve()
     try:

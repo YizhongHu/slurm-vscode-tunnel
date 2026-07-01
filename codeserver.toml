@@ -9,16 +9,15 @@ VSCODE_CLI_DISABLE_KEYCHAIN_ENCRYPT = "1"
 
 [profiles.cpu]
 enabled = true
-max_time = "24:00:00"
-default_time = "24:00:00"
+max_time = "08:00:00"
+default_time = "08:00:00"
 relay_overlap = "00:15:00"
 relay_ready_timeout = "00:05:00"
 relay_enabled = true
 sbatch_args = [
   "--nodes=1",
-  "--cpus-per-task=4",
-  "--mem=32G",
-  "--partition=day",
+  "--cpus-per-task=16",
+  "--mem-per-cpu=8G",
   "--job-name=codeserver-cpu",
 ]
 pre_commands = []
@@ -32,9 +31,8 @@ relay_ready_timeout = "00:05:00"
 relay_enabled = true
 sbatch_args = [
   "--nodes=1",
-  "--cpus-per-task=4",
-  "--mem=32G",
-  "--partition=gpu_devel",
+  "--cpus-per-task=16",
+  "--mem-per-cpu=8G",
   "--gpus=1",
   "--job-name=codeserver-gpu",
 ]
@@ -42,16 +40,15 @@ pre_commands = []
 
 [profiles.relay_test]
 enabled = true
-max_time = "00:02:00"
-default_time = "00:02:00"
-relay_overlap = "00:01:00"
-relay_ready_timeout = "00:01:00"
+max_time = "00:10:00"
+default_time = "00:10:00"
+relay_overlap = "00:02:00"
+relay_ready_timeout = "00:02:00"
 relay_enabled = true
 sbatch_args = [
   "--nodes=1",
   "--cpus-per-task=1",
   "--mem=1G",
-  "--partition=day",
   "--job-name=codeserver-relay-test",
 ]
 pre_commands = []

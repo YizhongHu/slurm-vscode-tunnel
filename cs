@@ -1,5 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.11
 import argparse
+import contextlib
+import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -7,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from typing import Any, Dict, List, Optional
 
@@ -17,7 +21,9 @@ from codeserver_lib import (
     ConfigError,
     default_config_path,
     die,
+    dump_json,
     expand_path,
+    get_profile,
     load_config,
     load_json,
     parse_slurm_seconds,
@@ -27,6 +33,9 @@ from codeserver_lib import (
     run_capture,
     state_from_status,
 )
+from codeserver_relay import format_duration as relay_format_duration
+from codeserver_relay import plan_relay
+from codeserver_relay import profile_time
 
 
 TOP_HELP = """usage: cs [command] [options] [target]
@@ -60,7 +69,8 @@ examples:
   cs stop cpu                Cancel current CPU tunnel session/chain.
   cs extend cpu 10h          Add 10 hours to the current CPU tunnel job.
   cs continue cpu            Continue/connect to the current CPU session node.
-  cs proxy codeserver-cpu    Proxy to SSH on the CPU job node.
+  cs proxy --auto-submit --wait cpu
+                             Submit/wait as needed, then proxy to the CPU job node.
 """
 
 SHORT_ACTIONS = {"-s": "submit", "-i": "status", "-l": "list", "-x": "stop", "-p": "proxy"}
@@ -189,6 +199,22 @@ def resolve_proxy_job_name(cfg: Dict[str, Any], target: Optional[str]) -> str:
     return job_name_for_profile(cfg, name) or name
 
 
+def proxy_target_selector(cfg: Dict[str, Any], target: Optional[str]) -> tuple[str, bool, str]:
+    requested = target or cfg["default_profile"]
+    if requested.isdigit():
+        return requested, True, f"job id: {requested}"
+    if requested in cfg["profiles"]:
+        job_name = resolve_proxy_job_name(cfg, requested)
+        return job_name, False, f"job name: {job_name}"
+
+    job_id = job_id_from_session_target(cfg, target)
+    if job_id and job_id != "DRY-RUN":
+        return job_id, True, f"job id: {job_id}"
+
+    job_name = resolve_proxy_job_name(cfg, target)
+    return job_name, False, f"job name: {job_name}"
+
+
 def job_id_from_session_target(cfg: Dict[str, Any], target: Optional[str]) -> Optional[str]:
     name = target or "latest"
     try:
@@ -242,16 +268,8 @@ def resolve_slurm_job_id(cfg: Dict[str, Any], target: Optional[str], *, command_
         die("squeue not found on this host", code=127)
 
     user = os.environ.get("USER", "")
-    requested = target or cfg["default_profile"]
-    job_id = requested if requested.isdigit() else job_id_from_session_target(cfg, target)
-
-    if job_id and job_id != "DRY-RUN":
-        matches = squeue_job_matches(user=user, target=job_id, by_job_id=True)
-        label = f"job id: {job_id}"
-    else:
-        job_name = resolve_proxy_job_name(cfg, target)
-        matches = squeue_job_matches(user=user, target=job_name, by_job_id=False)
-        label = f"job name: {job_name}"
+    selector, by_job_id, label = proxy_target_selector(cfg, target)
+    matches = squeue_job_matches(user=user, target=selector, by_job_id=by_job_id)
 
     if not matches:
         die(f"no pending or running allocation found for {label}", code=127)
@@ -266,25 +284,25 @@ def resolve_slurm_job_id(cfg: Dict[str, Any], target: Optional[str], *, command_
     return selected
 
 
-def first_node_for_target(cfg: Dict[str, Any], target: Optional[str], *, command_name: str) -> str:
+def running_node_for_target(
+    cfg: Dict[str, Any],
+    target: Optional[str],
+    *,
+    command_name: str,
+    required: bool,
+) -> Optional[str]:
     for cmd in ("squeue", "scontrol"):
         if shutil.which(cmd) is None:
             die(f"{cmd} not found on this host", code=127)
     user = os.environ.get("USER", "")
-    requested = target or cfg["default_profile"]
-    job_id = requested if requested.isdigit() else job_id_from_session_target(cfg, target)
-
-    if job_id:
-        matches = squeue_running_nodes(user=user, target=job_id, by_job_id=True)
-        label = f"job id: {job_id}"
-    else:
-        job_name = resolve_proxy_job_name(cfg, target)
-        matches = squeue_running_nodes(user=user, target=job_name, by_job_id=False)
-        label = f"job name: {job_name}"
+    selector, by_job_id, label = proxy_target_selector(cfg, target)
+    matches = squeue_running_nodes(user=user, target=selector, by_job_id=by_job_id)
 
     nodelist = matches[0] if matches else ""
     if not nodelist:
-        die(f"no running allocation found for {label}", code=127)
+        if required:
+            die(f"no running allocation found for {label}", code=127)
+        return None
     if len(matches) > 1:
         print(
             f"WARNING: {len(matches)} running allocations match {label}; "
@@ -301,6 +319,103 @@ def first_node_for_target(cfg: Dict[str, Any], target: Optional[str], *, command
     return node
 
 
+def first_node_for_target(cfg: Dict[str, Any], target: Optional[str], *, command_name: str) -> str:
+    node = running_node_for_target(cfg, target, command_name=command_name, required=True)
+    assert node is not None
+    return node
+
+
+def submit_hold_allocation(cfg: Dict[str, Any], profile_name: str, requested_seconds: Optional[int]) -> None:
+    try:
+        profile = get_profile(cfg, profile_name)
+        max_time = profile_time(profile, "max_time") or profile_time(profile, "default_time")
+        default_time = profile_time(profile, "default_time") or max_time
+    except ConfigError as exc:
+        die(f"{exc}. Use --help for usage.", code=2)
+
+    if default_time is None:
+        die(f"profile '{profile_name}' needs max_time/default_time or --time", code=2)
+
+    duration = requested_seconds or default_time
+    if max_time is not None and duration > max_time:
+        die(
+            f"auto-submit time {relay_format_duration(duration)} exceeds profile limit "
+            f"{relay_format_duration(max_time)}",
+            code=2,
+        )
+
+    submit_args = argparse.Namespace(
+        dry_run=False,
+        test_command=codeserver_submit.HOLD_COMMAND,
+    )
+    print(
+        f"cs proxy: submitting hold allocation profile={profile_name} "
+        f"time={relay_format_duration(duration)}",
+        file=sys.stderr,
+    )
+    with contextlib.redirect_stdout(sys.stderr):
+        codeserver_submit.submit_single(
+            cfg,
+            pathlib.Path(cfg["config_path"]),
+            profile_name,
+            profile,
+            duration,
+            submit_args,
+        )
+
+
+def maybe_auto_submit_for_proxy(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
+    if not args.auto_submit:
+        return
+    profile_name = args.target or cfg["default_profile"]
+    if profile_name not in cfg["profiles"]:
+        die("--auto-submit target must be omitted or be a profile name", code=2)
+
+    lock_dir = expand_path(cfg["root_dir"]) / "state"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"auto-submit-{profile_name}.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        job_name = resolve_proxy_job_name(cfg, profile_name)
+        matches = squeue_job_matches(
+            user=os.environ.get("USER", ""),
+            target=job_name,
+            by_job_id=False,
+        )
+        if matches:
+            summary = ", ".join(f"{match['job_id']}:{match['state']}" for match in matches)
+            print(f"cs proxy: using existing allocation(s): {summary}", file=sys.stderr)
+            return
+
+        requested = parse_duration_seconds(args.time) if args.time else None
+        submit_hold_allocation(cfg, profile_name, requested)
+
+
+def wait_for_first_node(cfg: Dict[str, Any], args: argparse.Namespace) -> str:
+    timeout = parse_duration_seconds(args.wait_timeout) if args.wait_timeout else None
+    poll_interval = max(1.0, float(args.poll_interval))
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    _, _, label = proxy_target_selector(cfg, args.target)
+    printed = False
+
+    while True:
+        node = running_node_for_target(
+            cfg,
+            args.target,
+            command_name=args.command,
+            required=False,
+        )
+        if node:
+            return node
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            die(f"timed out waiting for running allocation for {label}", code=127)
+        if not printed:
+            print(f"cs proxy: waiting for running allocation for {label}", file=sys.stderr)
+            printed = True
+        time.sleep(poll_interval)
+
+
 def exec_ssh_proxy(node: str) -> None:
     if shutil.which("nc"):
         os.execvp("nc", ["nc", node, "22"])
@@ -313,7 +428,11 @@ def cmd_connect(args: argparse.Namespace) -> int:
     # Shared handler for `proxy` and `continue`: both resolve the session node
     # and hand stdin/stdout to SSH on it.
     cfg = load_cfg(args.config)
-    node = first_node_for_target(cfg, args.target, command_name=args.command)
+    maybe_auto_submit_for_proxy(cfg, args)
+    if args.wait or args.auto_submit:
+        node = wait_for_first_node(cfg, args)
+    else:
+        node = first_node_for_target(cfg, args.target, command_name=args.command)
     exec_ssh_proxy(node)
     return 127
 
@@ -376,33 +495,213 @@ def job_field(job_text: str, field: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def job_seconds_until_end(job: Dict[str, Any]) -> int:
+    job_id = str(job.get("job_id") or "")
+    if not job_id or job_id.startswith("DRY-RUN"):
+        die(f"cannot extend relay segment without a real Slurm job id: {job_id or '-'}")
+    rc, out, err = run_capture(["squeue", "-h", "-j", job_id, "-o", "%T|%M|%l|%S"])
+    if rc != 0:
+        die(f"squeue failed:\n{err.strip() or out.strip()}", code=127)
+    if not out.strip():
+        die(f"job {job_id} is not pending or running; cannot extend relay")
+
+    state, elapsed_text, limit_text, start_text = out.splitlines()[0].split("|", 3)
+    state = state.strip().upper()
+    limit = parse_slurm_seconds(limit_text) or int(job.get("duration_seconds") or 0)
+    if limit <= 0:
+        die(f"could not determine time limit for job {job_id}")
+
+    if state == "RUNNING":
+        elapsed = parse_slurm_seconds(elapsed_text)
+        if elapsed is None:
+            die(f"could not determine elapsed time for running job {job_id}")
+        return max(0, limit - elapsed)
+
+    if state == "PENDING":
+        start = codeserver_status.parse_slurm_start(start_text)
+        if start is None:
+            die(f"job {job_id} is pending without an estimated start time; try extending after it starts")
+        now = dt.datetime.now(start.tzinfo)
+        return max(0, int((start - now).total_seconds())) + limit
+
+    die(f"job {job_id} is {state}, not pending/running; cannot extend relay")
+
+
+def chain_from_session(cfg: Dict[str, Any], session_dir: pathlib.Path) -> tuple[pathlib.Path, Dict[str, Any]]:
+    meta = load_json(session_dir / "meta.json")
+    root = expand_path(cfg["root_dir"])
+    state_dir = root / "state"
+    chain_id = f"{meta['session_id']}-relay"
+    chain_dir = root / "logs" / chain_id
+    chain_dir.mkdir(parents=True, exist_ok=True)
+
+    first_job = dict(meta)
+    first_job.update(
+        {
+            "type": "relay_segment",
+            "chain_id": chain_id,
+            "index": 1,
+            "begin_offset_seconds": 0,
+            "duration_seconds": int(meta.get("duration_seconds") or 0),
+            "previous_job_id": None,
+        }
+    )
+    chain = {
+        "type": "relay_chain",
+        "chain_id": chain_id,
+        "profile": meta["profile"],
+        "config_path": meta["config_path"],
+        "chain_dir": str(chain_dir),
+        "requested_time_seconds": int(meta.get("duration_seconds") or 0),
+        "profile_max_seconds": 0,
+        "relay_overlap_seconds": 0,
+        "relay_ready_timeout_seconds": 0,
+        "test_command": meta.get("test_command"),
+        "jobs": [first_job],
+    }
+    dump_json(chain_dir / "chain.json", chain)
+    codeserver_submit.update_current_links(state_dir, str(meta["profile"]), chain_dir)
+    return chain_dir, chain
+
+
+def load_or_create_chain(cfg: Dict[str, Any], session_dir: pathlib.Path) -> tuple[pathlib.Path, Dict[str, Any]]:
+    if (session_dir / "chain.json").exists():
+        return session_dir, load_json(session_dir / "chain.json")
+    return chain_from_session(cfg, session_dir)
+
+
+def append_relay_extension(
+    cfg: Dict[str, Any],
+    chain_dir: pathlib.Path,
+    chain: Dict[str, Any],
+    extra_seconds: int,
+) -> list[str]:
+    if extra_seconds <= 0:
+        die("extend duration must be positive", code=2)
+
+    profile_name = str(chain["profile"])
+    profile = get_profile(cfg, profile_name)
+    if not profile.get("relay_enabled", True):
+        die(f"profile '{profile_name}' has relay disabled", code=2)
+
+    max_time = int(chain.get("profile_max_seconds") or 0)
+    if max_time <= 0:
+        max_time = profile_time(profile, "max_time") or profile_time(profile, "default_time") or 0
+    if max_time <= 0:
+        die(f"profile '{profile_name}' needs max_time/default_time to extend relay", code=2)
+
+    overlap = int(chain.get("relay_overlap_seconds") or 0)
+    if overlap <= 0:
+        overlap = profile_time(profile, "relay_overlap") or 0
+    ready_timeout = int(chain.get("relay_ready_timeout_seconds") or 0)
+    if ready_timeout <= 0:
+        ready_timeout = profile_time(profile, "relay_ready_timeout") or 300
+
+    jobs = list(chain.get("jobs", []))
+    if not jobs:
+        die(f"relay chain has no jobs: {chain_dir / 'chain.json'}")
+    last_job = jobs[-1]
+    seconds_until_end = job_seconds_until_end(last_job)
+    submit_base_begin = max(0, seconds_until_end - overlap)
+
+    last_begin = int(last_job.get("begin_offset_seconds") or 0)
+    last_duration = int(last_job.get("duration_seconds") or 0)
+    metadata_base_begin = max(0, last_begin + last_duration - overlap)
+    requested_with_overlap = extra_seconds + overlap
+    segments = plan_relay(requested_with_overlap, max_time, overlap)
+
+    config_path = pathlib.Path(str(chain.get("config_path") or cfg["config_path"]))
+    python_bin = codeserver_submit.batch_python_bin()
+    inner_py = pathlib.Path(__file__).resolve().parent / "codeserver_inner.py"
+    previous_job_id = str(last_job.get("job_id") or "")
+    next_index = max(int(job.get("index", 0)) for job in jobs) + 1
+    submitted: list[str] = []
+
+    for offset, seg in enumerate(segments):
+        index = next_index + offset
+        seg_dir = chain_dir / f"job-{index:03d}"
+        run_log = seg_dir / "run.log"
+        tunnel_log = seg_dir / "tunnel.log"
+        batch_script = seg_dir / "batch.sh"
+        meta_json = seg_dir / "meta.json"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+
+        codeserver_submit.write_batch_script(
+            batch_script,
+            python_bin,
+            inner_py,
+            config_path,
+            profile_name,
+            seg_dir,
+            run_log,
+            tunnel_log,
+            profile["pre_commands"],
+            previous_job_id=previous_job_id or None,
+            relay_ready_timeout=ready_timeout,
+            test_command=chain.get("test_command"),
+        )
+        submit_begin = submit_base_begin + int(seg["begin_offset"])
+        sbatch_cmd = codeserver_submit.build_sbatch_cmd(
+            profile,
+            run_log,
+            batch_script,
+            int(seg["duration"]),
+            submit_begin,
+        )
+        job_id = codeserver_submit.submit_cmd(sbatch_cmd, False, "DRY-RUN")
+        submitted.append(job_id)
+
+        meta = {
+            "type": "relay_segment",
+            "session_id": f"{chain['chain_id']}-job-{index:03d}",
+            "chain_id": chain["chain_id"],
+            "profile": profile_name,
+            "config_path": str(config_path),
+            "session_dir": str(seg_dir),
+            "run_log": str(run_log),
+            "tunnel_log": str(tunnel_log),
+            "batch_script": str(batch_script),
+            "sbatch_cmd": sbatch_cmd,
+            "job_id": job_id,
+            "previous_job_id": previous_job_id or None,
+            "index": index,
+            "begin_offset_seconds": metadata_base_begin + int(seg["begin_offset"]),
+            "duration_seconds": int(seg["duration"]),
+        }
+        dump_json(meta_json, meta)
+        jobs.append(meta)
+        previous_job_id = job_id
+
+    chain["jobs"] = jobs
+    chain["requested_time_seconds"] = int(chain.get("requested_time_seconds") or 0) + extra_seconds
+    chain["profile_max_seconds"] = max_time
+    chain["relay_overlap_seconds"] = overlap
+    chain["relay_ready_timeout_seconds"] = ready_timeout
+    dump_json(chain_dir / "chain.json", chain)
+    return submitted
+
+
 def cmd_extend(args: argparse.Namespace) -> int:
     cfg = load_cfg(args.config)
-    if shutil.which("scontrol") is None:
-        die("scontrol not found on this host", code=127)
-
-    job_id = resolve_slurm_job_id(cfg, args.target, command_name=args.command)
     extra_seconds = parse_duration_seconds(args.duration)
+    try:
+        session_dir = resolve_session_dir(cfg, args.target or cfg["default_profile"])
+    except FileNotFoundError as exc:
+        die(f"{exc}. Use --help for usage.")
+    if not session_dir.exists():
+        die(f"no session found for '{args.target or cfg['default_profile']}'. Use --help for usage.")
 
-    rc, out, err = run_capture(["scontrol", "show", "job", "-o", job_id])
-    if rc != 0:
-        die(f"scontrol show job failed:\n{err.strip() or out.strip()}", code=127)
+    chain_dir, chain = load_or_create_chain(cfg, session_dir)
+    submitted = append_relay_extension(cfg, chain_dir, chain, extra_seconds)
 
-    current_raw = job_field(out, "TimeLimit")
-    current_seconds = parse_slurm_seconds(current_raw or "")
-    if current_raw is None or current_seconds is None:
-        die(f"could not parse current TimeLimit for job {job_id}: {current_raw or 'missing'}")
-
-    new_seconds = current_seconds + extra_seconds
-    new_limit = format_slurm_time(new_seconds)
-    rc, update_out, update_err = run_capture(["scontrol", "update", f"JobId={job_id}", f"TimeLimit={new_limit}"])
-    if rc != 0:
-        die(f"scontrol update failed:\n{update_err.strip() or update_out.strip()}")
-
-    print(f"extended job:    {job_id}")
-    print(f"old time limit:  {current_raw}")
-    print(f"added:           {format_slurm_time(extra_seconds)}")
-    print(f"new time limit:  {new_limit}")
+    print(f"extended relay:  {chain['chain_id']}")
+    print(f"profile:         {chain['profile']}")
+    print(f"added:           {relay_format_duration(extra_seconds)}")
+    print(f"submitted jobs:  {', '.join(submitted)}")
+    print(f"chain dir:       {chain_dir}")
+    print()
+    print(f"status:          cs status {chain['chain_id']}")
+    print(f"stop:            cs stop {chain['chain_id']}")
     return 0
 
 
@@ -591,6 +890,33 @@ def cmd_completion(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_connect_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait until the target allocation is running before proxying.",
+    )
+    parser.add_argument(
+        "--auto-submit",
+        action="store_true",
+        help="Submit a hold allocation for a profile if no pending/running allocation exists.",
+    )
+    parser.add_argument(
+        "--time",
+        help="Walltime for an auto-submitted hold allocation, e.g. 8h or 12:00:00.",
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        help="Maximum time to wait for a node, e.g. 30m. Default: wait indefinitely.",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=10.0,
+        help="Seconds between Slurm polling attempts while waiting.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cs", add_help=False, formatter_class=argparse.RawDescriptionHelpFormatter, description=TOP_HELP)
     parser.add_argument("-h", "--help", action="store_true", help=argparse.SUPPRESS)
@@ -604,6 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--time", help="Requested walltime, e.g. 72:00:00, 72h, 3d.")
     submit.add_argument("--relay-overlap", help="How long before expiry to start the next relay job.")
     submit.add_argument("--no-relay", action="store_true", help="Fail instead of splitting long requests.")
+    submit.add_argument("--hold", action="store_true", help="Hold a Slurm allocation open for VS Code Remote-SSH proxying.")
     submit.add_argument("--test-command", help="Developer/test command to run instead of code tunnel.")
 
     status = subparsers.add_parser("status", aliases=["stat", "i"], help="Show session status.")
@@ -631,6 +958,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_config_arg(cont, default=argparse.SUPPRESS)
     cont.add_argument("target", nargs="?", help="latest, profile name, session id, job id, or job name.")
+    add_connect_options(cont)
 
     list_parser = subparsers.add_parser("list", aliases=["l"], help="List known sessions.")
     add_config_arg(list_parser, default=argparse.SUPPRESS)
@@ -642,6 +970,7 @@ def build_parser() -> argparse.ArgumentParser:
     proxy = subparsers.add_parser("proxy", aliases=["p"], help="Proxy SSH to the session node.")
     add_config_arg(proxy, default=argparse.SUPPRESS)
     proxy.add_argument("target", nargs="?", help="latest, profile name, session id, job id, or job name.")
+    add_connect_options(proxy)
 
     profiles = subparsers.add_parser("profiles", help="Show configured profiles.")
     add_config_arg(profiles, default=argparse.SUPPRESS)
@@ -662,7 +991,7 @@ def legacy_args(args: argparse.Namespace, value: Optional[str]) -> List[str]:
     out: List[str] = []
     if value:
         out.append(value)
-    for name in ("dry_run", "no_relay"):
+    for name in ("dry_run", "no_relay", "hold"):
         if getattr(args, name, False):
             out.append("--" + name.replace("_", "-"))
     for name in ("time", "relay_overlap", "test_command"):

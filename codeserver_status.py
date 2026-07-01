@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 import argparse
 import datetime as dt
 import pathlib
@@ -21,6 +21,21 @@ from codeserver_lib import (
     tail_lines,
 )
 from codeserver_relay import format_duration as format_chain_duration
+
+
+TERMINAL_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "COMPLETED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "SPECIAL_EXIT",
+    "TIMEOUT",
+}
 
 
 def print_block(title: str, block: str) -> None:
@@ -119,6 +134,69 @@ def query_status_line(job_id: Optional[str]) -> str:
     return "unknown"
 
 
+def query_job_progress(job_id: Optional[str]) -> tuple[str, Optional[int], Optional[int]]:
+    if not job_id:
+        return "unknown", None, None
+
+    rc, out, _ = capture_status_cmd(["squeue", "-h", "-j", job_id, "-o", "%T|%M|%l"])
+    if rc == 0 and out.strip():
+        state, elapsed_text, limit_text = out.splitlines()[0].split("|", 2)
+        return (
+            state.strip() or "unknown",
+            parse_slurm_seconds(elapsed_text),
+            parse_slurm_seconds(limit_text),
+        )
+
+    rc, out, _ = capture_status_cmd(
+        [
+            "sacct",
+            "-n",
+            "-P",
+            "-j",
+            job_id,
+            "--format=JobIDRaw,State,Elapsed,Timelimit",
+        ]
+    )
+    if rc == 0 and out.strip():
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) < 4 or parts[0] != job_id:
+                continue
+            return (
+                parts[1] or "unknown",
+                parse_slurm_seconds(parts[2]),
+                parse_slurm_seconds(parts[3]),
+            )
+
+    return "unknown", None, None
+
+
+def relay_progress(chain: dict) -> tuple[int, int]:
+    requested = int(chain.get("requested_time_seconds") or 0)
+    used = 0
+    for job in chain.get("jobs", []):
+        job_id = str(job.get("job_id") or "")
+        begin = int(job.get("begin_offset_seconds") or 0)
+        duration = int(job.get("duration_seconds") or 0)
+
+        state, elapsed, _limit = (
+            ("unknown", None, None)
+            if job_id.startswith("DRY-RUN")
+            else query_job_progress(job_id)
+        )
+        state = state.upper()
+
+        if state == "RUNNING":
+            used = max(used, begin + min(elapsed or 0, duration))
+        elif state in TERMINAL_STATES:
+            terminal_elapsed = elapsed if elapsed is not None else duration
+            used = max(used, begin + min(terminal_elapsed, duration))
+
+    used = min(used, requested) if requested else used
+    remaining = max(0, requested - used)
+    return used, remaining
+
+
 def print_session(session_dir: pathlib.Path) -> int:
     meta_path = session_dir / "meta.json"
     if not meta_path.exists():
@@ -170,6 +248,9 @@ def print_chain(chain_dir: pathlib.Path) -> int:
     print(f"limit:       {format_chain_duration(int(chain['profile_max_seconds']))}")
     print(f"overlap:     {format_chain_duration(int(chain['relay_overlap_seconds']))}")
     print(f"segments:    {len(chain.get('jobs', []))}")
+    used, remaining = relay_progress(chain)
+    print(f"used:        {format_chain_duration(used)}")
+    print(f"remaining:   {format_chain_duration(remaining)}")
     print()
     print("IDX  JOB_ID       STATE     BEGIN       DURATION  PREV_JOB    LOG")
     for job in chain.get("jobs", []):

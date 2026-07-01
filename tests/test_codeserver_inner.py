@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import codeserver_inner
+import codeserver_status
 
 cs_loader = SourceFileLoader("cs", str(ROOT / "cs"))
 cs_spec = spec_from_loader("cs", cs_loader)
@@ -252,6 +253,38 @@ class SlurmSelectionTests(unittest.TestCase):
         ]
 
         self.assertEqual(cs.preferred_job_id(matches), "1993435")
+
+
+class RelayProgressTests(unittest.TestCase):
+    def test_relay_progress_uses_segment_begin_plus_elapsed(self):
+        chain = {
+            "requested_time_seconds": 10 * 60 * 60,
+            "jobs": [
+                {
+                    "job_id": "111",
+                    "begin_offset_seconds": 0,
+                    "duration_seconds": 8 * 60 * 60,
+                },
+                {
+                    "job_id": "222",
+                    "begin_offset_seconds": (7 * 60 * 60) + (45 * 60),
+                    "duration_seconds": (2 * 60 * 60) + (15 * 60),
+                },
+            ],
+        }
+
+        def fake_progress(job_id):
+            if job_id == "111":
+                return "COMPLETED", 8 * 60 * 60, 8 * 60 * 60
+            if job_id == "222":
+                return "RUNNING", 30 * 60, (2 * 60 * 60) + (15 * 60)
+            raise AssertionError(job_id)
+
+        with mock.patch.object(codeserver_status, "query_job_progress", fake_progress):
+            used, remaining = codeserver_status.relay_progress(chain)
+
+        self.assertEqual(used, (8 * 60 * 60) + (15 * 60))
+        self.assertEqual(remaining, (1 * 60 * 60) + (45 * 60))
 
 
 if __name__ == "__main__":
