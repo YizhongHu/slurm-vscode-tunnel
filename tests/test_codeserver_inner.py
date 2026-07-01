@@ -256,6 +256,23 @@ class SlurmSelectionTests(unittest.TestCase):
 
 
 class RelayProgressTests(unittest.TestCase):
+    def test_session_progress_reports_running_remaining_time(self):
+        meta = {
+            "job_id": "333",
+            "duration_seconds": 8 * 60 * 60,
+        }
+
+        with mock.patch.object(
+            codeserver_status,
+            "query_job_progress",
+            return_value=("RUNNING", 24 * 60, 8 * 60 * 60),
+        ):
+            requested, used, remaining = codeserver_status.session_progress(meta)
+
+        self.assertEqual(requested, 8 * 60 * 60)
+        self.assertEqual(used, 24 * 60)
+        self.assertEqual(remaining, (7 * 60 * 60) + (36 * 60))
+
     def test_relay_progress_uses_segment_begin_plus_elapsed(self):
         chain = {
             "requested_time_seconds": 10 * 60 * 60,

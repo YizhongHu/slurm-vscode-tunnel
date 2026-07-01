@@ -197,6 +197,27 @@ def relay_progress(chain: dict) -> tuple[int, int]:
     return used, remaining
 
 
+def session_progress(meta: dict) -> tuple[int, int, int]:
+    job_id = str(meta.get("job_id") or "")
+    state, elapsed, limit = (
+        ("unknown", None, None)
+        if job_id.startswith("DRY-RUN")
+        else query_job_progress(job_id)
+    )
+    requested = int(meta.get("duration_seconds") or limit or 0)
+    state = state.upper()
+
+    if state == "RUNNING":
+        used = min(elapsed or 0, requested)
+    elif state in TERMINAL_STATES:
+        used = min(elapsed if elapsed is not None else requested, requested)
+    else:
+        used = 0
+
+    remaining = max(0, requested - used)
+    return requested, used, remaining
+
+
 def print_session(session_dir: pathlib.Path) -> int:
     meta_path = session_dir / "meta.json"
     if not meta_path.exists():
@@ -214,6 +235,11 @@ def print_session(session_dir: pathlib.Path) -> int:
     print(f"tunnel log:  {tunnel_log}")
     print(f"config:      {meta['config_path']}")
     print(f"job id:      {job_id or '-'}")
+    requested, used, remaining = session_progress(meta)
+    if requested:
+        print(f"requested:   {format_chain_duration(requested)}")
+        print(f"used:        {format_chain_duration(used)}")
+        print(f"remaining:   {format_chain_duration(remaining)}")
 
     auth_found = False
     for title, path in (("auth prompt from run.log", run_log), ("auth prompt from tunnel.log", tunnel_log)):
