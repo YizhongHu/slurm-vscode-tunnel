@@ -1,5 +1,6 @@
 #!/usr/bin/env python3.11
 import argparse
+import os
 import pathlib
 import subprocess
 import tomllib
@@ -30,18 +31,56 @@ def scancel(job_id: str) -> None:
         die(f"scancel {job_id} failed:\n{proc.stderr.strip() or proc.stdout.strip()}")
 
 
+def current_slurm_job_ids() -> set[str]:
+    out: set[str] = set()
+    for name in ("SLURM_JOB_ID", "SLURM_JOBID"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            out.add(value)
+    return out
+
+
+def real_job_ids(job_ids: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for job_id in job_ids:
+        clean = str(job_id).strip()
+        if not clean or clean.startswith("DRY-RUN") or clean in seen:
+            continue
+        out.append(clean)
+        seen.add(clean)
+    return out
+
+
+def cancel_order(job_ids: List[str]) -> List[str]:
+    current = current_slurm_job_ids()
+    if not current:
+        return job_ids
+    return [job_id for job_id in job_ids if job_id not in current] + [
+        job_id for job_id in job_ids if job_id in current
+    ]
+
+
+def cancel_jobs(job_ids: List[str]) -> List[str]:
+    ordered = cancel_order(real_job_ids(job_ids))
+    for job_id in ordered:
+        scancel(job_id)
+    return ordered
+
+
 def stop_chain(session_dir: pathlib.Path) -> int:
     chain = load_json(session_dir / "chain.json")
     job_ids: List[str] = []
     for job in chain.get("jobs", []):
         job_id = str(job.get("job_id") or "")
-        if job_id and not job_id.startswith("DRY-RUN"):
-            scancel(job_id)
+        if job_id:
             job_ids.append(job_id)
+    canceled = cancel_order(real_job_ids(job_ids))
     print(f"stopped relay chain: {chain.get('chain_id', session_dir.name)}")
     print(f"profile:             {chain.get('profile', '-')}")
-    print(f"canceled jobs:       {', '.join(job_ids) if job_ids else '-'}")
+    print(f"canceled jobs:       {', '.join(canceled) if canceled else '-'}")
     print(f"chain dir:           {session_dir}")
+    cancel_jobs(canceled)
     return 0
 
 
@@ -54,13 +93,13 @@ def stop_session(session_dir: pathlib.Path, target: str) -> int:
     job_id = meta.get("job_id")
     if not job_id:
         die(f"session '{meta.get('session_id', target)}' has no job_id to stop")
-    if not str(job_id).startswith("DRY-RUN"):
-        scancel(str(job_id))
+    canceled = real_job_ids([str(job_id)])
 
     print(f"stopped session: {meta.get('session_id', target)}")
     print(f"profile:         {meta.get('profile', '-')}")
     print(f"job id:          {job_id}")
     print(f"session dir:     {session_dir}")
+    cancel_jobs(canceled)
     return 0
 
 

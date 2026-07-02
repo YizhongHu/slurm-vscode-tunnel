@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 import codeserver_inner
 import codeserver_status
+import codeserver_stop
 
 cs_loader = SourceFileLoader("cs", str(ROOT / "cs"))
 cs_spec = spec_from_loader("cs", cs_loader)
@@ -253,6 +254,47 @@ class SlurmSelectionTests(unittest.TestCase):
         ]
 
         self.assertEqual(cs.preferred_job_id(matches), "1993435")
+
+
+class StopOrderTests(unittest.TestCase):
+    def test_current_slurm_job_is_canceled_last(self):
+        with mock.patch.dict(os.environ, {"SLURM_JOB_ID": "111"}, clear=False):
+            self.assertEqual(
+                codeserver_stop.cancel_order(["111", "222", "333"]),
+                ["222", "333", "111"],
+            )
+
+    def test_dry_run_and_duplicate_jobs_are_not_canceled(self):
+        self.assertEqual(
+            codeserver_stop.real_job_ids(["DRY-RUN", "222", "222", "", "333"]),
+            ["222", "333"],
+        )
+
+    def test_stop_chain_cancels_current_slurm_job_last(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            chain_dir = pathlib.Path(tmp)
+            (chain_dir / "chain.json").write_text(
+                json.dumps(
+                    {
+                        "chain_id": "test-chain",
+                        "profile": "cpu",
+                        "jobs": [
+                            {"job_id": "111"},
+                            {"job_id": "222"},
+                            {"job_id": "333"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            canceled = []
+
+            with mock.patch.dict(os.environ, {"SLURM_JOB_ID": "111"}, clear=False):
+                with mock.patch.object(codeserver_stop, "scancel", canceled.append):
+                    with mock.patch("builtins.print"):
+                        codeserver_stop.stop_chain(chain_dir)
+
+            self.assertEqual(canceled, ["222", "333", "111"])
 
 
 class RelayProgressTests(unittest.TestCase):
